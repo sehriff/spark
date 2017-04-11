@@ -218,7 +218,8 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
       request: HttpServletRequest,
       tableHeaderId: String,
       jobTag: String,
-      jobs: Seq[JobUIData]): Seq[Node] = {
+      jobs: Seq[JobUIData],
+      killEnabled: Boolean): Seq[Node] = {
     val allParameters = request.getParameterMap.asScala.toMap
     val parameterOtherTable = allParameters.filterNot(_._1.startsWith(jobTag))
       .map(para => para._1 + "=" + para._2(0))
@@ -264,6 +265,7 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
         parameterOtherTable,
         parent.jobProgresslistener.stageIdToInfo,
         parent.jobProgresslistener.stageIdToData,
+        killEnabled,
         currentTime,
         jobIdTitle,
         pageSize = jobPageSize,
@@ -287,12 +289,15 @@ private[ui] class AllJobsPage(parent: JobsTab) extends WebUIPage("") {
       val startTime = listener.startTime
       val endTime = listener.endTime
       val activeJobs = listener.activeJobs.values.toSeq
-      val completedJobs = listener.completedJobs.reverse.toSeq
-      val failedJobs = listener.failedJobs.reverse.toSeq
+      val completedJobs = listener.completedJobs.reverse
+      val failedJobs = listener.failedJobs.reverse
 
-      val activeJobsTable = jobsTable(request, "active", "activeJob", activeJobs)
-      val completedJobsTable = jobsTable(request, "completed", "completedJob", completedJobs)
-      val failedJobsTable = jobsTable(request, "failed", "failedJob", failedJobs)
+      val activeJobsTable =
+        jobsTable(request, "active", "activeJob", activeJobs, killEnabled = parent.killEnabled)
+      val completedJobsTable =
+        jobsTable(request, "completed", "completedJob", completedJobs, killEnabled = false)
+      val failedJobsTable =
+        jobsTable(request, "failed", "failedJob", failedJobs, killEnabled = false)
 
       val shouldShowActiveJobs = activeJobs.nonEmpty
       val shouldShowCompletedJobs = completedJobs.nonEmpty
@@ -457,23 +462,11 @@ private[ui] class JobDataSource(
    * Return Ordering according to sortColumn and desc
    */
   private def ordering(sortColumn: String, desc: Boolean): Ordering[JobTableRowData] = {
-    val ordering = sortColumn match {
-      case "Job Id" | "Job Id (Job Group)" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.Int.compare(x.jobData.jobId, y.jobData.jobId)
-      }
-      case "Description" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.String.compare(x.lastStageDescription, y.lastStageDescription)
-      }
-      case "Submitted" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.Long.compare(x.submissionTime, y.submissionTime)
-      }
-      case "Duration" => new Ordering[JobTableRowData] {
-        override def compare(x: JobTableRowData, y: JobTableRowData): Int =
-          Ordering.Long.compare(x.duration, y.duration)
-      }
+    val ordering: Ordering[JobTableRowData] = sortColumn match {
+      case "Job Id" | "Job Id (Job Group)" => Ordering.by(_.jobData.jobId)
+      case "Description" => Ordering.by(x => (x.lastStageDescription, x.lastStageName))
+      case "Submitted" => Ordering.by(_.submissionTime)
+      case "Duration" => Ordering.by(_.duration)
       case "Stages: Succeeded/Total" | "Tasks (for all stages): Succeeded/Total" =>
         throw new IllegalArgumentException(s"Unsortable column: $sortColumn")
       case unknownColumn => throw new IllegalArgumentException(s"Unknown column: $unknownColumn")
@@ -495,19 +488,20 @@ private[ui] class JobPagedTable(
     parameterOtherTable: Iterable[String],
     stageIdToInfo: HashMap[Int, StageInfo],
     stageIdToData: HashMap[(Int, Int), StageUIData],
+    killEnabled: Boolean,
     currentTime: Long,
     jobIdTitle: String,
     pageSize: Int,
     sortColumn: String,
     desc: Boolean
   ) extends PagedTable[JobTableRowData] {
-  val parameterPath = UIUtils.prependBaseUri(basePath) + s"/$subPath/?" +
-    parameterOtherTable.mkString("&")
+  val parameterPath = basePath + s"/$subPath/?" + parameterOtherTable.mkString("&")
 
   override def tableId: String = jobTag + "-table"
 
   override def tableCssClass: String =
-    "table table-bordered table-condensed table-striped table-head-clickable"
+    "table table-bordered table-condensed table-striped " +
+      "table-head-clickable table-cell-width-limited"
 
   override def pageSizeFormField: String = jobTag + ".pageSize"
 
@@ -599,12 +593,30 @@ private[ui] class JobPagedTable(
   override def row(jobTableRow: JobTableRowData): Seq[Node] = {
     val job = jobTableRow.jobData
 
+    val killLink = if (killEnabled) {
+      val confirm =
+        s"if (window.confirm('Are you sure you want to kill job ${job.jobId} ?')) " +
+          "{ this.parentNode.submit(); return true; } else { return false; }"
+      // SPARK-6846 this should be POST-only but YARN AM won't proxy POST
+      /*
+      val killLinkUri = s"$basePathUri/jobs/job/kill/"
+      <form action={killLinkUri} method="POST" style="display:inline">
+        <input type="hidden" name="id" value={job.jobId.toString}/>
+        <a href="#" onclick={confirm} class="kill-link">(kill)</a>
+      </form>
+       */
+      val killLinkUri = s"$basePath/jobs/job/kill/?id=${job.jobId}"
+      <a href={killLinkUri} onclick={confirm} class="kill-link">(kill)</a>
+    } else {
+      Seq.empty
+    }
+
     <tr id={"job-" + job.jobId}>
       <td>
         {job.jobId} {job.jobGroup.map(id => s"($id)").getOrElse("")}
       </td>
       <td>
-        {jobTableRow.jobDescription}
+        {jobTableRow.jobDescription} {killLink}
         <a href={jobTableRow.detailUrl} class="name-link">{jobTableRow.lastStageName}</a>
       </td>
       <td>
@@ -618,8 +630,8 @@ private[ui] class JobPagedTable(
       </td>
       <td class="progress-cell">
         {UIUtils.makeProgressBar(started = job.numActiveTasks, completed = job.numCompletedTasks,
-        failed = job.numFailedTasks, skipped = job.numSkippedTasks, killed = job.numKilledTasks,
-        total = job.numTasks - job.numSkippedTasks)}
+        failed = job.numFailedTasks, skipped = job.numSkippedTasks,
+        reasonToNumKilled = job.reasonToNumKilled, total = job.numTasks - job.numSkippedTasks)}
       </td>
     </tr>
   }
